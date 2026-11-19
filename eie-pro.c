@@ -90,6 +90,7 @@ struct eie {
 
 	__u8 cap_endpoint_addr;
 	struct urb *cap_urbs[CAP_URB_CNT];
+	size_t cap_buf_size;
 	struct snd_pcm_substream *cap_substream;
 	unsigned int cap_buf_pos;
 	unsigned int cap_frames;
@@ -104,7 +105,9 @@ struct eie {
 	__u8 min_endpoint_addr;
 	__u8 mout_endpoint_addr;
 	struct urb *min_urbs[MIN_URB_CNT];
+	size_t min_buf_size;
 	struct urb *mout_urbs[MOUT_URB_CNT];
+	size_t mout_buf_size;
 	unsigned long submitted_mout_urbs;
 	struct snd_rawmidi_substream *min_substream;
 	struct snd_rawmidi_substream *mout_substream;
@@ -969,15 +972,15 @@ static void kill_all_urbs(struct eie *eie)
 	}
 }
 
-static void kill_and_free_urb(struct eie *eie, struct urb **urbp)
+/* size must be the size passed to usb_alloc_coherent(), not the URB length */
+static void kill_and_free_urb(struct eie *eie, struct urb **urbp, size_t size)
 {
 	struct urb *urb = *urbp;
 
 	if (urb) {
 		usb_kill_urb(urb);
 		if (urb->transfer_buffer != NULL)
-			usb_free_coherent(eie->udev,
-				urb->transfer_buffer_length,
+			usb_free_coherent(eie->udev, size,
 				urb->transfer_buffer,
 				urb->transfer_dma);
 		usb_free_urb(urb);
@@ -990,19 +993,21 @@ static void free_usb_related_resources(struct eie *eie)
 	int i;
 
 	for (i = 0; i < PLAY_URB_CNT; i++)
-		kill_and_free_urb(eie, &eie->play_urbs[i].urb);
+		kill_and_free_urb(eie, &eie->play_urbs[i].urb,
+				 PLAY_PKT_CNT * eie->play_packet_size);
 
 	for (i = 0; i < SYNC_URB_CNT; i++)
-		kill_and_free_urb(eie, &eie->sync_urbs[i]);
+		kill_and_free_urb(eie, &eie->sync_urbs[i],
+				 eie->sync_packet_size);
 
 	for (i = 0; i < CAP_URB_CNT; i++)
-		kill_and_free_urb(eie, &eie->cap_urbs[i]);
+		kill_and_free_urb(eie, &eie->cap_urbs[i], eie->cap_buf_size);
 
 	for (i = 0; i < MIN_URB_CNT; i++)
-		kill_and_free_urb(eie, &eie->min_urbs[i]);
+		kill_and_free_urb(eie, &eie->min_urbs[i], eie->min_buf_size);
 
 	for (i = 0; i < MOUT_URB_CNT; i++)
-		kill_and_free_urb(eie, &eie->mout_urbs[i]);
+		kill_and_free_urb(eie, &eie->mout_urbs[i], eie->mout_buf_size);
 
 	if (eie->ifb) {
 		usb_set_intfdata(eie->ifb, NULL);
@@ -1114,6 +1119,7 @@ static int init_cap_urbs(struct eie *eie,
 	int err = 0;
 
 	eie->cap_endpoint_addr = endpoint->bEndpointAddress;
+	eie->cap_buf_size = usb_endpoint_maxp(endpoint);
 	for (j = 0; j < CAP_URB_CNT; j++) {
 		urb = usb_alloc_urb(0, GFP_KERNEL);
 		if (urb == NULL) {
@@ -1132,6 +1138,7 @@ static int init_cap_urbs(struct eie *eie,
 		usb_fill_bulk_urb(urb, eie->udev,
 			usb_rcvbulkpipe(eie->udev, eie->cap_endpoint_addr), buf,
 			usb_endpoint_maxp(endpoint), cap_urb_complete, eie);
+		urb->transfer_flags = URB_NO_TRANSFER_DMA_MAP;
 
 		eie->cap_urbs[j] = urb;
 	}
@@ -1148,6 +1155,7 @@ static int init_mout_urbs(struct eie *eie,
 	int err = 0;
 
 	eie->mout_endpoint_addr = endpoint->bEndpointAddress;
+	eie->mout_buf_size = usb_endpoint_maxp(endpoint);
 	for (j = 0; j < MOUT_URB_CNT; j++) {
 		urb = usb_alloc_urb(0, GFP_KERNEL);
 		if (urb == NULL) {
@@ -1166,6 +1174,7 @@ static int init_mout_urbs(struct eie *eie,
 		usb_fill_bulk_urb(urb, eie->udev,
 			usb_sndbulkpipe(eie->udev, eie->mout_endpoint_addr), buf,
 			usb_endpoint_maxp(endpoint), mout_urb_complete, eie);
+		urb->transfer_flags = URB_NO_TRANSFER_DMA_MAP;
 
 		eie->mout_urbs[j] = urb;
 	}
@@ -1182,6 +1191,7 @@ static int init_min_urbs(struct eie *eie,
 	int err = 0;
 
 	eie->min_endpoint_addr = endpoint->bEndpointAddress;
+	eie->min_buf_size = usb_endpoint_maxp(endpoint);
 	for (j = 0; j < MIN_URB_CNT; j++) {
 		urb = usb_alloc_urb(0, GFP_KERNEL);
 		if (urb == NULL) {
@@ -1200,6 +1210,7 @@ static int init_min_urbs(struct eie *eie,
 		usb_fill_bulk_urb(urb, eie->udev,
 			usb_rcvbulkpipe(eie->udev, eie->min_endpoint_addr), buf,
 			usb_endpoint_maxp(endpoint), min_urb_complete, eie);
+		urb->transfer_flags = URB_NO_TRANSFER_DMA_MAP;
 
 		eie->min_urbs[j] = urb;
 	}
