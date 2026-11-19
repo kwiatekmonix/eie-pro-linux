@@ -42,9 +42,10 @@ static struct usb_driver eie_driver;
 /*
  * TODO: redefine states & respect the close command again
  * TODO: limit the rate at open() to the rate of the running stream; prepare
- *       refuses a different rate while the other stream is RUNNING, but a
- *       PREPARED (not yet started) stream and a trigger START racing with
- *       reset_eie() are not protected
+ *       refuses a different rate (-EBUSY) while the other stream is RUNNING
+ *       and eie->rate != 0 (with eie->rate == 0 the guard does not refuse),
+ *       but a PREPARED (not yet started) stream and a trigger START racing
+ *       with reset_eie() are not protected
  * TODO: correctly handle xruns
  */
 
@@ -478,9 +479,9 @@ static int eie_prepare_rate(struct eie *eie, unsigned int rate,
 	       eie->rate != 0 && eie->rate != rate;
 	spin_unlock_irqrestore(&eie->lock, flags);
 	if (busy) {
-		dev_info(&eie->udev->dev,
-			 "Rate %u refused: other stream runs at %u\n",
-			 rate, READ_ONCE(eie->rate));
+		dev_info_ratelimited(&eie->udev->dev,
+				     "Rate %u refused: other stream runs at %u\n",
+				     rate, READ_ONCE(eie->rate));
 		return -EBUSY;
 	}
 
