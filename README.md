@@ -15,6 +15,34 @@ The driver is heavily inspired by the ua101 driver from the Linux kernel
 source tree.
 
 
+## About this fork
+
+This is a fork of [MatTaylorSharrow/eie-pro-linux](https://github.com/MatTaylorSharrow/eie-pro-linux)
+with a series of stability fixes. What changed, what was tested and what is
+still open is in [FORK.md](FORK.md). The driver is still experimental.
+
+## Install (Ubuntu / Debian, DKMS)
+
+You need the kernel headers for your running kernel and `dkms`:
+
+```
+sudo apt install dkms linux-headers-$(uname -r)
+sudo cp -r dkms/eie-pro-0.1 /usr/src/eie-pro-0.1
+sudo dkms add -m eie-pro -v 0.1
+sudo dkms build -m eie-pro -v 0.1
+sudo dkms install -m eie-pro -v 0.1
+```
+
+Plug in the EIE Pro; the module loads automatically. Check with `lsmod | grep eie`
+and `arecord -l`. With Secure Boot enabled, DKMS has to sign the module with a
+key you have enrolled (MOK), otherwise it will not load.
+
+Remove: `sudo dkms remove -m eie-pro -v 0.1 --all`.
+
+To try it once without installing: `make` in the repository root and
+`sudo insmod eie-pro.ko` (does not survive a reboot).
+
+
 ## USB protocol
 
 The USB device is identified by vednor ID 0x09e8 and product ID 0x0010. It has
