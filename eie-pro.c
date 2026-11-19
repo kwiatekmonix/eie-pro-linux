@@ -1618,7 +1618,6 @@ static int eie_probe(struct usb_interface *interface,
 
 
 	/* prepare the card struct */
-	snd_card_set_dev(card, &interface->dev);
 
 	strscpy(card->driver, "EIE");
 	strscpy(card->shortname, name);
