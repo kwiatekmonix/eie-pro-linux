@@ -355,8 +355,10 @@ static int cap_urbs_restart(struct eie *eie)
 
 	cap_urbs_kill(eie);
 	err = submit_init_cap_urbs(eie);
-	if (err < 0)
+	if (err < 0) {
 		cap_urbs_kill(eie);
+		clear_bit(CAP_URBS_ON, &eie->states);
+	}
 
 	return err;
 }
@@ -468,9 +470,12 @@ static int reset_eie(struct eie *eie, unsigned int rate)
 	if (err < 0)
 		goto out;
 
-	err = submit_init_cap_urbs(eie);
-	if (err < 0)
-		goto out;
+	/* capture runs only if prepared; otherwise cap_urbs_restart() starts it */
+	if (test_bit(CAP_URBS_ON, &eie->states)) {
+		err = submit_init_cap_urbs(eie);
+		if (err < 0)
+			goto out;
+	}
 
 	if (!wait_event_timeout(eie->urbs_flow_wait,
 				test_bit(URBS_FLOWING, &eie->states) ||
