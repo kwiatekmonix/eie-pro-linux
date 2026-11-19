@@ -73,6 +73,9 @@ struct eie {
 
 	unsigned int rate;
 
+	/* process context only: URB start/stop (reset_eie), disconnect */
+	struct mutex mutex;
+
 	__u8 sync_endpoint_addr;
 	size_t sync_packet_size;
 	struct urb *sync_urbs[SYNC_URB_CNT];
@@ -349,6 +352,7 @@ static int send_magic_sequence(struct eie *eie, struct magic_seq *m, char *data)
 static int reset_eie(struct eie *eie, unsigned int rate)
 {
 	int err = 0;
+	unsigned long flags;
 	unsigned char *data;
 
 	if (test_bit(DISCONNECTED, &eie->states))
@@ -361,7 +365,9 @@ static int reset_eie(struct eie *eie, unsigned int rate)
 	dev_dbg(&eie->udev->dev, "Resetting device");
 	kill_all_urbs(eie);
 	/* a failure below must make the next prepare redo the reset */
+	spin_lock_irqsave(&eie->lock, flags);
 	eie->rate = 0;
+	spin_unlock_irqrestore(&eie->lock, flags);
 	eie_set_alt_setting(eie);
 
 	dev_dbg(&eie->udev->dev, "Starting magic initialization sequence.");
@@ -380,7 +386,9 @@ static int reset_eie(struct eie *eie, unsigned int rate)
 
 	dev_dbg(&eie->udev->dev, "Completed magic initialization sequence.");
 
+	spin_lock_irqsave(&eie->lock, flags);
 	eie->rate = rate;
+	spin_unlock_irqrestore(&eie->lock, flags);
 
 	/* all URBs are dead here; wait for a fresh first play URB below */
 	clear_bit(URBS_FLOWING, &eie->states);
@@ -404,8 +412,11 @@ static int reset_eie(struct eie *eie, unsigned int rate)
 
 out:
 	/* make the next prepare retry the reset */
-	if (err)
+	if (err) {
+		spin_lock_irqsave(&eie->lock, flags);
 		eie->rate = 0;
+		spin_unlock_irqrestore(&eie->lock, flags);
+	}
 
 	kfree(data);
 	return err;
@@ -416,8 +427,10 @@ static int eie_ppcm_prepare(struct snd_pcm_substream *substream)
 	int err = 0;
 	struct eie *eie = substream->private_data;
 
+	mutex_lock(&eie->mutex);
 	if (substream->runtime->rate != eie->rate)
 		err = reset_eie(eie, substream->runtime->rate);
+	mutex_unlock(&eie->mutex);
 
 	eie->played_frames = 0;
 	eie->play_buf_pos = 0;
@@ -431,8 +444,10 @@ static int eie_cpcm_prepare(struct snd_pcm_substream *substream)
 	int err = 0;
 	struct eie *eie = substream->private_data;
 
+	mutex_lock(&eie->mutex);
 	if (substream->runtime->rate != eie->rate)
 		err = reset_eie(eie, substream->runtime->rate);
+	mutex_unlock(&eie->mutex);
 
 	eie->cap_frames = 0;
 	eie->cap_buf_pos = 0;
@@ -1328,6 +1343,7 @@ static int eie_probe(struct usb_interface *interface,
 	eie->card = card;
 	eie->card_index = card_index;
 
+	mutex_init(&eie->mutex);
 	spin_lock_init(&eie->lock);
 	init_waitqueue_head(&eie->urbs_flow_wait);
 
@@ -1396,7 +1412,9 @@ static int eie_probe(struct usb_interface *interface,
 	return 0;
 
 probe_err:
+	mutex_lock(&eie->mutex);
 	free_usb_related_resources(eie);
+	mutex_unlock(&eie->mutex);
 	snd_card_free(card);
 	mutex_unlock(&devices_mutex);
 	return err;
@@ -1412,9 +1430,12 @@ static void eie_disconnect(struct usb_interface *interface)
 	mutex_lock(&devices_mutex);
 
 	set_bit(DISCONNECTED, &eie->states);
+	/* release a reset_eie() waiting for URBs while it holds eie->mutex */
 	wake_up(&eie->urbs_flow_wait);
 
+	mutex_lock(&eie->mutex);
 	free_usb_related_resources(eie);
+	mutex_unlock(&eie->mutex);
 	snd_card_free_when_closed(eie->card);
 
 	mutex_unlock(&devices_mutex);
