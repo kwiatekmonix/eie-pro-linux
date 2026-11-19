@@ -978,6 +978,15 @@ static void abort_playback(struct eie *eie)
 	}
 }
 
+/* plain kill/unlink/disconnect of the URB;
+ * any other status is a real transfer error
+ */
+static bool urb_status_is_kill(int status)
+{
+	return status == -ENOENT || status == -ECONNRESET ||
+	       status == -ESHUTDOWN;
+}
+
 static void play_urb_complete(struct urb *urb)
 {
 	struct eie_playback_urb *epu = urb->context;
@@ -989,7 +998,12 @@ static void play_urb_complete(struct urb *urb)
 
 	/* for ISO this means that we have been killed or unlinked */
 	if (urb->status != 0) {
-		dev_dbg(&eie->udev->dev, "Play urb complete. %d", urb->status);
+		if (urb_status_is_kill(urb->status))
+			dev_dbg(&eie->udev->dev, "Play urb complete. %d",
+				urb->status);
+		else
+			dev_warn_ratelimited(&eie->udev->dev,
+					     "Play urb error %d\n", urb->status);
 		return;
 	}
 
@@ -1038,8 +1052,12 @@ static void sync_urb_complete(struct urb *urb)
 
 	/* for ISO this means that we have been killed or unlinked */
 	if (urb->status != 0) {
-		dev_dbg(&eie->udev->dev, "Sync urb complete. status = %d, packets = %d",
-			urb->status, urb->number_of_packets);
+		if (urb_status_is_kill(urb->status))
+			dev_dbg(&eie->udev->dev, "Sync urb complete. status = %d, packets = %d",
+				urb->status, urb->number_of_packets);
+		else
+			dev_warn_ratelimited(&eie->udev->dev,
+					     "Sync urb error %d\n", urb->status);
 		return;
 	}
 
@@ -1076,7 +1094,12 @@ static void cap_urb_complete(struct urb *urb)
 	int err;
 
 	if (urb->status != 0) {
-		dev_dbg(&eie->udev->dev, "Capture urb complete. %d", urb->status);
+		if (urb_status_is_kill(urb->status))
+			dev_dbg(&eie->udev->dev, "Capture urb complete. %d",
+				urb->status);
+		else
+			dev_warn_ratelimited(&eie->udev->dev,
+					     "Capture urb error %d\n", urb->status);
 		return;
 	}
 
@@ -1184,7 +1207,12 @@ static void min_urb_complete(struct urb *urb)
 	int i, err;
 
 	if (urb->status != 0) {
-		dev_dbg(&eie->udev->dev, "Midi in urb complete. %d", urb->status);
+		if (urb_status_is_kill(urb->status))
+			dev_dbg(&eie->udev->dev, "Midi in urb complete. %d",
+				urb->status);
+		else
+			dev_warn_ratelimited(&eie->udev->dev,
+					     "Midi in urb error %d\n", urb->status);
 		return;
 	}
 
@@ -1206,8 +1234,14 @@ static void mout_urb_complete(struct urb *urb)
 	struct eie *eie = urb->context;
 	int i;
 
-	if (urb->status != 0)
-		dev_dbg(&eie->udev->dev, "Midi out urb complete. %d", urb->status);
+	if (urb->status != 0) {
+		if (urb_status_is_kill(urb->status))
+			dev_dbg(&eie->udev->dev, "Midi out urb complete. %d",
+				urb->status);
+		else
+			dev_warn_ratelimited(&eie->udev->dev,
+					     "Midi out urb error %d\n", urb->status);
+	}
 
 	for (i = 0; i < MOUT_URB_CNT; i++) {
 		if (eie->mout_urbs[i] == urb) {
