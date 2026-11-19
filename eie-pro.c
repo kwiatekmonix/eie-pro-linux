@@ -53,6 +53,7 @@ enum {
 	PLAYBACK_RUNNING,
 	CAPTURE_RUNNING,
 	URBS_FLOWING,
+	CAP_URBS_ON, /* capture prepared; changed only under eie->mutex */
 	DISCONNECTED,
 	MIN_OPEN,
 	MIN_UP
@@ -148,6 +149,7 @@ static struct snd_pcm_hardware eie_playback_hw = {
 };
 
 static void kill_all_urbs(struct eie *eie);
+static void cap_urbs_kill(struct eie *eie);
 static int submit_init_play_urbs(struct eie *eie);
 
 static int eie_set_alt_setting(struct eie *eie)
@@ -223,6 +225,11 @@ static int eie_cpcm_close(struct snd_pcm_substream *substream)
 	clear_bit(CAPTURE_RUNNING, &eie->states);
 	eie->cap_substream = NULL;
 	spin_unlock_irqrestore(&eie->lock, flags);
+
+	mutex_lock(&eie->mutex);
+	clear_bit(CAP_URBS_ON, &eie->states);
+	cap_urbs_kill(eie);
+	mutex_unlock(&eie->mutex);
 
 	return 0;
 }
@@ -333,6 +340,25 @@ static int submit_init_cap_urbs(struct eie *eie)
 	dev_dbg(&eie->udev->dev, "Submitted capture urbs.");
 
 	return 0;
+}
+
+/*
+ * called with eie->mutex held; the kill makes the submit safe even if the
+ * URBs are still active or died with an error status
+ */
+static int cap_urbs_restart(struct eie *eie)
+{
+	int err;
+
+	if (test_bit(DISCONNECTED, &eie->states))
+		return -ENODEV;
+
+	cap_urbs_kill(eie);
+	err = submit_init_cap_urbs(eie);
+	if (err < 0)
+		cap_urbs_kill(eie);
+
+	return err;
 }
 
 struct magic_seq {
@@ -522,6 +548,11 @@ static int eie_cpcm_prepare(struct snd_pcm_substream *substream)
 		substream->runtime->rate, READ_ONCE(eie->rate));
 	mutex_lock(&eie->mutex);
 	err = eie_prepare_rate(eie, substream->runtime->rate, PLAYBACK_RUNNING);
+	if (!err) {
+		err = cap_urbs_restart(eie);
+		if (!err)
+			set_bit(CAP_URBS_ON, &eie->states);
+	}
 	mutex_unlock(&eie->mutex);
 
 	spin_lock_irqsave(&eie->lock, flags);
@@ -1197,6 +1228,14 @@ static void kill_all_urbs(struct eie *eie)
 		if (urb)
 			usb_kill_urb(urb);
 	}
+
+	cap_urbs_kill(eie);
+}
+
+static void cap_urbs_kill(struct eie *eie)
+{
+	struct urb *urb;
+	int i;
 
 	for (i = 0; i < CAP_URB_CNT; i++) {
 		urb = eie->cap_urbs[i];
