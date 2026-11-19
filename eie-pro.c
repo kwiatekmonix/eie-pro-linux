@@ -166,32 +166,42 @@ static int eie_prepare_hw(struct snd_pcm_substream *substream)
 static int eie_ppcm_open(struct snd_pcm_substream *substream)
 {
 	struct eie *eie = substream->private_data;
+	unsigned long flags;
 	int err;
 
 	err = eie_prepare_hw(substream);
 	if (err < 0)
 		return err;
+	spin_lock_irqsave(&eie->lock, flags);
 	eie->play_substream = substream;
+	spin_unlock_irqrestore(&eie->lock, flags);
 	return 0;
 }
 
 static int eie_cpcm_open(struct snd_pcm_substream *substream)
 {
 	struct eie *eie = substream->private_data;
+	unsigned long flags;
 	int err;
 
 	err = eie_prepare_hw(substream);
 	if (err < 0)
 		return err;
+	spin_lock_irqsave(&eie->lock, flags);
 	eie->cap_substream = substream;
+	spin_unlock_irqrestore(&eie->lock, flags);
 	return 0;
 }
 
 static int eie_ppcm_close(struct snd_pcm_substream *substream)
 {
 	struct eie *eie = substream->private_data;
+	unsigned long flags;
 
+	spin_lock_irqsave(&eie->lock, flags);
+	clear_bit(PLAYBACK_RUNNING, &eie->states);
 	eie->play_substream = NULL;
+	spin_unlock_irqrestore(&eie->lock, flags);
 
 	return 0;
 }
@@ -199,8 +209,12 @@ static int eie_ppcm_close(struct snd_pcm_substream *substream)
 static int eie_cpcm_close(struct snd_pcm_substream *substream)
 {
 	struct eie *eie = substream->private_data;
+	unsigned long flags;
 
+	spin_lock_irqsave(&eie->lock, flags);
+	clear_bit(CAPTURE_RUNNING, &eie->states);
 	eie->cap_substream = NULL;
+	spin_unlock_irqrestore(&eie->lock, flags);
 
 	return 0;
 }
@@ -425,16 +439,19 @@ out:
 static int eie_ppcm_prepare(struct snd_pcm_substream *substream)
 {
 	int err = 0;
+	unsigned long flags;
 	struct eie *eie = substream->private_data;
 
 	mutex_lock(&eie->mutex);
-	if (substream->runtime->rate != eie->rate)
+	if (substream->runtime->rate != READ_ONCE(eie->rate))
 		err = reset_eie(eie, substream->runtime->rate);
 	mutex_unlock(&eie->mutex);
 
+	spin_lock_irqsave(&eie->lock, flags);
 	eie->played_frames = 0;
 	eie->play_buf_pos = 0;
 	substream->runtime->delay = 0;
+	spin_unlock_irqrestore(&eie->lock, flags);
 
 	return err;
 }
@@ -442,16 +459,19 @@ static int eie_ppcm_prepare(struct snd_pcm_substream *substream)
 static int eie_cpcm_prepare(struct snd_pcm_substream *substream)
 {
 	int err = 0;
+	unsigned long flags;
 	struct eie *eie = substream->private_data;
 
 	mutex_lock(&eie->mutex);
-	if (substream->runtime->rate != eie->rate)
+	if (substream->runtime->rate != READ_ONCE(eie->rate))
 		err = reset_eie(eie, substream->runtime->rate);
 	mutex_unlock(&eie->mutex);
 
+	spin_lock_irqsave(&eie->lock, flags);
 	eie->cap_frames = 0;
 	eie->cap_buf_pos = 0;
 	substream->runtime->delay = 0; // TODO
+	spin_unlock_irqrestore(&eie->lock, flags);
 
 	return err;
 }
@@ -536,16 +556,16 @@ static __must_check int fill_playback_urb(struct eie_playback_urb *epu)
 	return 0;
 }
 
-static bool check_period_elapsed(struct eie *eie)
+static struct snd_pcm_substream *check_period_elapsed(struct eie *eie)
 {
 	struct snd_pcm_substream *substream = eie->play_substream;
 
 	if (substream != NULL
 		&& eie->played_frames >= substream->runtime->period_size) {
 		eie->played_frames %= substream->runtime->period_size;
-		return true;
+		return substream;
 	}
-	return false;
+	return NULL;
 }
 
 static int submit_init_play_urbs(struct eie *eie)
@@ -578,15 +598,20 @@ out:
 static int eie_ppcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct eie *eie = substream->private_data;
+	unsigned long flags;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 		dev_dbg(&eie->udev->dev, "play: SNDRV_PCM_TRIGGER_START");
+		spin_lock_irqsave(&eie->lock, flags);
 		set_bit(PLAYBACK_RUNNING, &eie->states);
+		spin_unlock_irqrestore(&eie->lock, flags);
 		return 0;
 	case SNDRV_PCM_TRIGGER_STOP:
 		dev_dbg(&eie->udev->dev, "play: SNDRV_PCM_TRIGGER_STOP");
+		spin_lock_irqsave(&eie->lock, flags);
 		clear_bit(PLAYBACK_RUNNING, &eie->states);
+		spin_unlock_irqrestore(&eie->lock, flags);
 		return 0;
 	default:
 		return -EINVAL;
@@ -596,15 +621,20 @@ static int eie_ppcm_trigger(struct snd_pcm_substream *substream, int cmd)
 static int eie_cpcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct eie *eie = substream->private_data;
+	unsigned long flags;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 		dev_dbg(&eie->udev->dev, "cap: SNDRV_PCM_TRIGGER_START");
+		spin_lock_irqsave(&eie->lock, flags);
 		set_bit(CAPTURE_RUNNING, &eie->states);
+		spin_unlock_irqrestore(&eie->lock, flags);
 		return 0;
 	case SNDRV_PCM_TRIGGER_STOP:
 		dev_dbg(&eie->udev->dev, "cap: SNDRV_PCM_TRIGGER_STOP");
+		spin_lock_irqsave(&eie->lock, flags);
 		clear_bit(CAPTURE_RUNNING, &eie->states);
+		spin_unlock_irqrestore(&eie->lock, flags);
 		return 0;
 	default:
 		return -EINVAL;
@@ -792,25 +822,29 @@ static const struct snd_rawmidi_ops eie_midi_in_ops = {
 
 static void abort_playback(struct eie *eie)
 {
+	struct snd_pcm_substream *play = NULL, *cap = NULL;
 	unsigned long flags;
 
-	if (test_bit(PLAYBACK_RUNNING, &eie->states)
-		&& eie->play_substream != NULL) {
-		snd_pcm_stream_lock_irqsave(eie->play_substream, flags);
-		snd_pcm_stop(eie->play_substream, SNDRV_PCM_STATE_XRUN);
-		snd_pcm_stream_unlock_irqrestore(eie->play_substream, flags);
-	}
-
-	if (test_bit(CAPTURE_RUNNING, &eie->states)
-		&& eie->cap_substream != NULL) {
-		snd_pcm_stream_lock_irqsave(eie->cap_substream, flags);
-		snd_pcm_stop(eie->cap_substream, SNDRV_PCM_STATE_XRUN);
-		snd_pcm_stream_unlock_irqrestore(eie->cap_substream, flags);
-	}
-
+	/* the stream lock must not be taken under eie->lock, so copy first */
 	spin_lock_irqsave(&eie->lock, flags);
+	if (test_bit(PLAYBACK_RUNNING, &eie->states))
+		play = eie->play_substream;
+	if (test_bit(CAPTURE_RUNNING, &eie->states))
+		cap = eie->cap_substream;
 	eie->rate = 0;
 	spin_unlock_irqrestore(&eie->lock, flags);
+
+	if (play) {
+		snd_pcm_stream_lock_irqsave(play, flags);
+		snd_pcm_stop(play, SNDRV_PCM_STATE_XRUN);
+		snd_pcm_stream_unlock_irqrestore(play, flags);
+	}
+
+	if (cap) {
+		snd_pcm_stream_lock_irqsave(cap, flags);
+		snd_pcm_stop(cap, SNDRV_PCM_STATE_XRUN);
+		snd_pcm_stream_unlock_irqrestore(cap, flags);
+	}
 }
 
 static void play_urb_complete(struct urb *urb)
@@ -819,7 +853,7 @@ static void play_urb_complete(struct urb *urb)
 	struct eie *eie = epu->eie;
 	unsigned long flags;
 	int err;
-	bool elapsed = false;
+	struct snd_pcm_substream *elapsed = NULL;
 	bool abort = false;
 
 	/* for ISO this means that we have been killed or unlinked */
@@ -843,8 +877,8 @@ static void play_urb_complete(struct urb *urb)
 		goto err;
 	}
 
-	elapsed = test_bit(PLAYBACK_RUNNING, &eie->states)
-		&& check_period_elapsed(eie);
+	if (test_bit(PLAYBACK_RUNNING, &eie->states))
+		elapsed = check_period_elapsed(eie);
 
 	err = usb_submit_urb(urb, GFP_ATOMIC);
 	if (err < 0) {
@@ -854,7 +888,7 @@ static void play_urb_complete(struct urb *urb)
 err:
 	spin_unlock_irqrestore(&eie->lock, flags);
 	if (elapsed)
-		snd_pcm_period_elapsed(eie->play_substream);
+		snd_pcm_period_elapsed(elapsed);
 	if (abort)
 		abort_playback(eie);
 }
