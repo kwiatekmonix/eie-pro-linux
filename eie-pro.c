@@ -1556,6 +1556,11 @@ static int eie_probe(struct usb_interface *interface,
 	return 0;
 
 probe_err:
+	/* no new user of the card from here on; see eie_disconnect() */
+	set_bit(DISCONNECTED, &eie->states);
+	wake_up(&eie->urbs_flow_wait);
+	snd_card_disconnect(card);
+
 	mutex_lock(&eie->mutex);
 	free_usb_related_resources(eie);
 	mutex_unlock(&eie->mutex);
@@ -1567,19 +1572,36 @@ probe_err:
 static void eie_disconnect(struct usb_interface *interface)
 {
 	struct eie *eie = usb_get_intfdata(interface);
+	unsigned int card_index;
 
 	if (!eie)
 		return;
 
 	mutex_lock(&devices_mutex);
 
+	/* eie may be freed by snd_card_free_when_closed() below */
+	card_index = eie->card_index;
+
 	set_bit(DISCONNECTED, &eie->states);
 	/* release a reset_eie() waiting for URBs while it holds eie->mutex */
 	wake_up(&eie->urbs_flow_wait);
 
+	/*
+	 * Stop user space (no new open/ioctl, running PCMs are stopped)
+	 * before the URBs are freed.
+	 */
+	snd_card_disconnect(eie->card);
+
 	mutex_lock(&eie->mutex);
 	free_usb_related_resources(eie);
 	mutex_unlock(&eie->mutex);
+
+	/*
+	 * As in ua101: the index is released before the card is actually
+	 * freed, which may be delayed until the last file is closed.
+	 */
+	devices_used &= ~(1U << card_index);
+
 	snd_card_free_when_closed(eie->card);
 
 	mutex_unlock(&devices_mutex);
