@@ -86,6 +86,10 @@ struct eie {
 	struct eie_playback_urb play_urbs[PLAY_URB_CNT];
 	struct snd_pcm_substream *play_substream;
 	wait_queue_head_t urbs_flow_wait;
+	/* callbacks between the pointer copy and the end of its use */
+	atomic_t play_in_cb;
+	atomic_t cap_in_cb;
+	wait_queue_head_t cb_wait;
 
 	unsigned int play_buf_pos;
 	unsigned int played_frames;
@@ -776,6 +780,32 @@ static void eie_mout_trigger(struct snd_rawmidi_substream *substream, int up)
 	}
 }
 
+/*
+ * Called by the PCM core in process context after the stream was stopped
+ * (also before prepare, hw_params and hw_free). Wait until no callback uses
+ * the substream pointer it copied, so that close can free the runtime.
+ */
+static int eie_pcm_sync_stop(struct eie *eie, atomic_t *in_cb)
+{
+	if (!wait_event_timeout(eie->cb_wait, atomic_read(in_cb) == 0, HZ))
+		dev_err(&eie->udev->dev, "Timeout waiting for URB callbacks.");
+	return 0;
+}
+
+static int eie_ppcm_sync_stop(struct snd_pcm_substream *substream)
+{
+	struct eie *eie = substream->private_data;
+
+	return eie_pcm_sync_stop(eie, &eie->play_in_cb);
+}
+
+static int eie_cpcm_sync_stop(struct snd_pcm_substream *substream)
+{
+	struct eie *eie = substream->private_data;
+
+	return eie_pcm_sync_stop(eie, &eie->cap_in_cb);
+}
+
 static const struct snd_pcm_ops eie_playback_pcm_ops = {
 	.open = eie_ppcm_open,
 	.close = eie_ppcm_close,
@@ -784,6 +814,7 @@ static const struct snd_pcm_ops eie_playback_pcm_ops = {
 	.hw_free = eie_pcm_hw_free,
 	.prepare = eie_ppcm_prepare,
 	.trigger = eie_ppcm_trigger,
+	.sync_stop = eie_ppcm_sync_stop,
 	.pointer = eie_ppcm_pointer,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
 	.page = snd_pcm_lib_get_vmalloc_page,
@@ -800,6 +831,7 @@ static const struct snd_pcm_ops eie_capture_pcm_ops = {
 	.hw_free = eie_pcm_hw_free,
 	.prepare = eie_cpcm_prepare,
 	.trigger = eie_cpcm_trigger,
+	.sync_stop = eie_cpcm_sync_stop,
 	.pointer = eie_cpcm_pointer,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
 	.page = snd_pcm_lib_get_vmalloc_page,
@@ -827,10 +859,16 @@ static void abort_playback(struct eie *eie)
 
 	/* the stream lock must not be taken under eie->lock, so copy first */
 	spin_lock_irqsave(&eie->lock, flags);
-	if (test_bit(PLAYBACK_RUNNING, &eie->states))
+	if (test_bit(PLAYBACK_RUNNING, &eie->states)) {
 		play = eie->play_substream;
-	if (test_bit(CAPTURE_RUNNING, &eie->states))
+		if (play)
+			atomic_inc(&eie->play_in_cb);
+	}
+	if (test_bit(CAPTURE_RUNNING, &eie->states)) {
 		cap = eie->cap_substream;
+		if (cap)
+			atomic_inc(&eie->cap_in_cb);
+	}
 	eie->rate = 0;
 	spin_unlock_irqrestore(&eie->lock, flags);
 
@@ -838,12 +876,16 @@ static void abort_playback(struct eie *eie)
 		snd_pcm_stream_lock_irqsave(play, flags);
 		snd_pcm_stop(play, SNDRV_PCM_STATE_XRUN);
 		snd_pcm_stream_unlock_irqrestore(play, flags);
+		if (atomic_dec_and_test(&eie->play_in_cb))
+			wake_up(&eie->cb_wait);
 	}
 
 	if (cap) {
 		snd_pcm_stream_lock_irqsave(cap, flags);
 		snd_pcm_stop(cap, SNDRV_PCM_STATE_XRUN);
 		snd_pcm_stream_unlock_irqrestore(cap, flags);
+		if (atomic_dec_and_test(&eie->cap_in_cb))
+			wake_up(&eie->cb_wait);
 	}
 }
 
@@ -877,8 +919,11 @@ static void play_urb_complete(struct urb *urb)
 		goto err;
 	}
 
-	if (test_bit(PLAYBACK_RUNNING, &eie->states))
+	if (test_bit(PLAYBACK_RUNNING, &eie->states)) {
 		elapsed = check_period_elapsed(eie);
+		if (elapsed)
+			atomic_inc(&eie->play_in_cb);
+	}
 
 	err = usb_submit_urb(urb, GFP_ATOMIC);
 	if (err < 0) {
@@ -887,8 +932,11 @@ static void play_urb_complete(struct urb *urb)
 	}
 err:
 	spin_unlock_irqrestore(&eie->lock, flags);
-	if (elapsed)
+	if (elapsed) {
 		snd_pcm_period_elapsed(elapsed);
+		if (atomic_dec_and_test(&eie->play_in_cb))
+			wake_up(&eie->cb_wait);
+	}
 	if (abort)
 		abort_playback(eie);
 }
@@ -1380,6 +1428,9 @@ static int eie_probe(struct usb_interface *interface,
 	mutex_init(&eie->mutex);
 	spin_lock_init(&eie->lock);
 	init_waitqueue_head(&eie->urbs_flow_wait);
+	init_waitqueue_head(&eie->cb_wait);
+	atomic_set(&eie->play_in_cb, 0);
+	atomic_set(&eie->cap_in_cb, 0);
 
 	eie->ifa = interface;
 	eie->ifb = usb_ifnum_to_if(eie->udev, 1);
