@@ -31,7 +31,7 @@ static struct usb_driver eie_driver;
 #define PLAY_URB_CNT 2
 #define PLAY_PKT_CNT 40
 
-#define CAP_URB_CNT 2
+#define CAP_URB_CNT 4
 #define CAP_BUF_SIZE 4096
 
 #define MIN_URB_CNT 2
@@ -312,6 +312,25 @@ static int submit_init_sync_urbs(struct eie *eie)
 	return 0;
 }
 
+static int submit_init_cap_urbs(struct eie *eie)
+{
+	int err;
+	int i;
+
+	for (i = 0; i < CAP_URB_CNT; i++) {
+		err = usb_submit_urb(eie->cap_urbs[i], GFP_KERNEL);
+		if (err < 0) {
+			dev_err(&eie->udev->dev, "USB request error %d %s",
+				err, usb_error_string(err));
+			return err;
+		}
+	}
+
+	dev_dbg(&eie->udev->dev, "Submitted capture urbs.");
+
+	return 0;
+}
+
 struct magic_seq {
 	__u8 type;
 	__u8 request;
@@ -416,6 +435,10 @@ static int reset_eie(struct eie *eie, unsigned int rate)
 		goto out;
 
 	err = submit_init_play_urbs(eie);
+	if (err < 0)
+		goto out;
+
+	err = submit_init_cap_urbs(eie);
 	if (err < 0)
 		goto out;
 
@@ -981,6 +1004,7 @@ static void cap_urb_complete(struct urb *urb)
 	unsigned int len;
 	unsigned long flags;
 	bool abort = false;
+	bool resubmit_stopped = false;
 	int err;
 
 	if (urb->status != 0) {
@@ -1057,9 +1081,14 @@ static void cap_urb_complete(struct urb *urb)
 
 	err = usb_submit_urb(urb, GFP_ATOMIC);
 	if (err < 0) {
-		if (!fault)
-			fault = "cannot resubmit urb";
-		abort = true;
+		/* urb being killed or device gone: not a capture fault */
+		if (err == -EPERM || err == -ENODEV || err == -ESHUTDOWN) {
+			resubmit_stopped = true;
+		} else {
+			if (!fault)
+				fault = "cannot resubmit urb";
+			abort = true;
+		}
 	}
 	spin_unlock_irqrestore(&eie->lock, flags);
 
@@ -1068,6 +1097,9 @@ static void cap_urb_complete(struct urb *urb)
 		if (atomic_dec_and_test(&eie->cap_in_cb))
 			wake_up(&eie->cb_wait);
 	}
+	if (resubmit_stopped)
+		dev_dbg(&eie->udev->dev, "Capture urb not resubmitted: %d", err);
+	dev_dbg_ratelimited(&eie->udev->dev, "Capture urb length %u", len);
 	if (len % 64)
 		dev_warn_ratelimited(&eie->udev->dev,
 			"Capture urb length %u is not a multiple of 64\n", len);
