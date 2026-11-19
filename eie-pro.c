@@ -351,12 +351,17 @@ static int reset_eie(struct eie *eie, unsigned int rate)
 	int err = 0;
 	unsigned char *data;
 
+	if (test_bit(DISCONNECTED, &eie->states))
+		return -ENODEV;
+
 	data = kmalloc(MAX_MAGIC_SEQ_LENGTH, GFP_KERNEL);
 	if (!data)
 		return -ENOMEM;
 
 	dev_dbg(&eie->udev->dev, "Resetting device");
 	kill_all_urbs(eie);
+	/* a failure below must make the next prepare redo the reset */
+	eie->rate = 0;
 	eie_set_alt_setting(eie);
 
 	dev_dbg(&eie->udev->dev, "Starting magic initialization sequence.");
@@ -397,11 +402,11 @@ static int reset_eie(struct eie *eie, unsigned int rate)
 		err = -ENODEV;
 	}
 
+out:
 	/* make the next prepare retry the reset */
 	if (err)
 		eie->rate = 0;
 
-out:
 	kfree(data);
 	return err;
 }
