@@ -41,7 +41,10 @@ static struct usb_driver eie_driver;
 
 /*
  * TODO: redefine states & respect the close command again
- * TODO: fix opening of the 2nd stream to be limited to the rate of the 1st
+ * TODO: limit the rate at open() to the rate of the running stream; prepare
+ *       refuses a different rate while the other stream is RUNNING, but a
+ *       PREPARED (not yet started) stream and a trigger START racing with
+ *       reset_eie() are not protected
  * TODO: correctly handle xruns
  */
 
@@ -463,15 +466,40 @@ out:
 	return err;
 }
 
+/* called with eie->mutex held */
+static int eie_prepare_rate(struct eie *eie, unsigned int rate,
+			    int other_running_bit)
+{
+	unsigned long flags;
+	bool busy;
+
+	spin_lock_irqsave(&eie->lock, flags);
+	busy = test_bit(other_running_bit, &eie->states) &&
+	       eie->rate != 0 && eie->rate != rate;
+	spin_unlock_irqrestore(&eie->lock, flags);
+	if (busy) {
+		dev_info(&eie->udev->dev,
+			 "Rate %u refused: other stream runs at %u\n",
+			 rate, READ_ONCE(eie->rate));
+		return -EBUSY;
+	}
+
+	if (rate == READ_ONCE(eie->rate))
+		return 0;
+
+	return reset_eie(eie, rate);
+}
+
 static int eie_ppcm_prepare(struct snd_pcm_substream *substream)
 {
 	int err = 0;
 	unsigned long flags;
 	struct eie *eie = substream->private_data;
 
+	dev_dbg(&eie->udev->dev, "play: prepare rate=%u eie->rate=%u\n",
+		substream->runtime->rate, READ_ONCE(eie->rate));
 	mutex_lock(&eie->mutex);
-	if (substream->runtime->rate != READ_ONCE(eie->rate))
-		err = reset_eie(eie, substream->runtime->rate);
+	err = eie_prepare_rate(eie, substream->runtime->rate, CAPTURE_RUNNING);
 	mutex_unlock(&eie->mutex);
 
 	spin_lock_irqsave(&eie->lock, flags);
@@ -489,9 +517,10 @@ static int eie_cpcm_prepare(struct snd_pcm_substream *substream)
 	unsigned long flags;
 	struct eie *eie = substream->private_data;
 
+	dev_dbg(&eie->udev->dev, "cap: prepare rate=%u eie->rate=%u\n",
+		substream->runtime->rate, READ_ONCE(eie->rate));
 	mutex_lock(&eie->mutex);
-	if (substream->runtime->rate != READ_ONCE(eie->rate))
-		err = reset_eie(eie, substream->runtime->rate);
+	err = eie_prepare_rate(eie, substream->runtime->rate, PLAYBACK_RUNNING);
 	mutex_unlock(&eie->mutex);
 
 	spin_lock_irqsave(&eie->lock, flags);
@@ -985,6 +1014,8 @@ static void sync_urb_complete(struct urb *urb)
 
 			if (d == 0) {
 				/* the device did not advance clock */
+				dev_info_ratelimited(&eie->udev->dev,
+						     "Sync urb: device did not advance clock\n");
 				abort_playback(eie);
 			}
 			atomic_add(d, &eie->frames_elapsed);
