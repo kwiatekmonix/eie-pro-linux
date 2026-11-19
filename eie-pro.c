@@ -49,7 +49,7 @@ enum {
 	PLAYBACK_RUNNING,
 	CAPTURE_RUNNING,
 	URBS_FLOWING,
-	DISCONNECTED, /* TODO use */
+	DISCONNECTED,
 	MIN_OPEN,
 	MIN_UP
 };
@@ -377,6 +377,9 @@ static int reset_eie(struct eie *eie, unsigned int rate)
 
 	eie->rate = rate;
 
+	/* all URBs are dead here; wait for a fresh first play URB below */
+	clear_bit(URBS_FLOWING, &eie->states);
+
 	err = submit_init_sync_urbs(eie);
 	if (err < 0)
 		goto out;
@@ -385,7 +388,18 @@ static int reset_eie(struct eie *eie, unsigned int rate)
 	if (err < 0)
 		goto out;
 
-	wait_event(eie->urbs_flow_wait, test_bit(URBS_FLOWING, &eie->states));
+	if (!wait_event_timeout(eie->urbs_flow_wait,
+				test_bit(URBS_FLOWING, &eie->states) ||
+				test_bit(DISCONNECTED, &eie->states), HZ)) {
+		dev_err(&eie->udev->dev, "Timeout waiting for URBs to start\n");
+		err = -ETIMEDOUT;
+	} else if (test_bit(DISCONNECTED, &eie->states)) {
+		err = -ENODEV;
+	}
+
+	/* make the next prepare retry the reset */
+	if (err)
+		eie->rate = 0;
 
 out:
 	kfree(data);
