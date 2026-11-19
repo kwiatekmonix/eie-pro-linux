@@ -1351,11 +1351,13 @@ static int eie_probe(struct usb_interface *interface,
 
 	eie->rmidi = rmidi;
 
-	err = snd_card_register(card);
+	err = init_urbs(eie);
 	if (err < 0)
 		goto probe_err;
 
-	init_urbs(eie);
+	err = snd_card_register(card);
+	if (err < 0)
+		goto probe_err;
 
 	usb_set_intfdata(interface, eie);
 	devices_used |= 1 << card_index;
