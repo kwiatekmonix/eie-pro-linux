@@ -32,12 +32,12 @@ static struct usb_driver eie_driver;
 #define PLAY_PKT_CNT 40
 
 #define CAP_URB_CNT 2
+#define CAP_BUF_SIZE 4096
 
 #define MIN_URB_CNT 2
 #define MOUT_URB_CNT 2
 
 #define BYTES_PER_FRAME 12
-#define BYTES_PER_FRAME_CAP 16
 
 /*
  * TODO: redefine states & respect the close command again
@@ -976,6 +976,11 @@ static void sync_urb_complete(struct urb *urb)
 static void cap_urb_complete(struct urb *urb)
 {
 	struct eie *eie = urb->context;
+	struct snd_pcm_substream *elapsed = NULL;
+	const char *fault = NULL;
+	unsigned int len;
+	unsigned long flags;
+	bool abort = false;
 	int err;
 
 	if (urb->status != 0) {
@@ -983,46 +988,94 @@ static void cap_urb_complete(struct urb *urb)
 		return;
 	}
 
-	/* TODO: write ALSA part & implement (spin)locking */
-	if (test_bit(CAPTURE_RUNNING, &eie->states)) {
+	/* the urb belongs to the HCD again after the resubmit below */
+	len = urb->actual_length;
 
+	spin_lock_irqsave(&eie->lock, flags);
+	if (test_bit(CAPTURE_RUNNING, &eie->states) && eie->cap_substream) {
+		struct snd_pcm_runtime *runtime = eie->cap_substream->runtime;
+		unsigned char *buf = urb->transfer_buffer;
+		unsigned int frames_rcvd = len / 64;
 		unsigned int ch1, ch2, ch3, ch4;
 		unsigned int i, j;
-		unsigned char *buf = urb->transfer_buffer;
-		unsigned int frames_rcvd = urb->actual_length / 64;
-		bool elapsed;
-		struct snd_pcm_runtime *runtime = eie->cap_substream->runtime;
 
-		for (i = 0; i < frames_rcvd; i++) {
-			__le32 *out = (__le32 *) (runtime->dma_area + eie->cap_buf_pos * BYTES_PER_FRAME_CAP);
+		if (!runtime->dma_area)
+			fault = "no dma area";
+		else if ((size_t)runtime->buffer_size * BYTES_PER_FRAME > runtime->dma_bytes)
+			fault = "buffer larger than dma area";
+		else if (eie->cap_buf_pos >= runtime->buffer_size)
+			fault = "position outside buffer";
+		else if (frames_rcvd > runtime->buffer_size)
+			fault = "urb larger than buffer";
 
-			eie->cap_buf_pos++;
-			eie->cap_buf_pos %= runtime->buffer_size;
+		if (fault) {
+			abort = true;
+		} else {
+			for (i = 0; i < frames_rcvd; i++) {
+				unsigned char *out = runtime->dma_area +
+					eie->cap_buf_pos * BYTES_PER_FRAME;
 
-			ch1 = ch2 = ch3 = ch4 = 0;
-			for (j = 0; j < 24; j++) {
-				ch1 |= (buf[64*i + j +  0]        & 1) << (23-j);
-				ch2 |= (buf[64*i + j + 32]        & 1) << (23-j);
-				ch3 |= ((buf[64*i + j +  0] >> 1) & 1) << (23-j);
-				ch4 |= ((buf[64*i + j + 32] >> 1) & 1) << (23-j);
+				ch1 = ch2 = ch3 = ch4 = 0;
+				for (j = 0; j < 24; j++) {
+					ch1 |= (buf[64*i + j +  0]        & 1) << (23-j);
+					ch2 |= (buf[64*i + j + 32]        & 1) << (23-j);
+					ch3 |= ((buf[64*i + j +  0] >> 1) & 1) << (23-j);
+					ch4 |= ((buf[64*i + j + 32] >> 1) & 1) << (23-j);
+				}
+				/* S24_3LE */
+				out[0] = ch1;
+				out[1] = ch1 >> 8;
+				out[2] = ch1 >> 16;
+				out[3] = ch2;
+				out[4] = ch2 >> 8;
+				out[5] = ch2 >> 16;
+				out[6] = ch3;
+				out[7] = ch3 >> 8;
+				out[8] = ch3 >> 16;
+				out[9] = ch4;
+				out[10] = ch4 >> 8;
+				out[11] = ch4 >> 16;
+
+				if (++eie->cap_buf_pos == runtime->buffer_size)
+					eie->cap_buf_pos = 0;
 			}
-			out[0] = __cpu_to_le32(ch1);
-			out[1] = __cpu_to_le32(ch2);
-			out[2] = __cpu_to_le32(ch3);
-			out[3] = __cpu_to_le32(ch4);
-		}
 
-		eie->cap_frames += frames_rcvd;
-		elapsed = eie->cap_frames > runtime->period_size;
-		if (elapsed) {
-			eie->cap_frames = 0;
-			snd_pcm_period_elapsed(eie->cap_substream);
+			/*
+			 * One urb carries at most CAP_BUF_SIZE / 64 frames (64 bytes
+			 * per frame on the wire), i.e. 64 frames. period_bytes_min is
+			 * 64 * BYTES_PER_FRAME, so period_size is at least 64 frames
+			 * and one period_elapsed per urb is enough.
+			 */
+			eie->cap_frames += frames_rcvd;
+			if (eie->cap_frames >= runtime->period_size) {
+				eie->cap_frames %= runtime->period_size;
+				elapsed = eie->cap_substream;
+				atomic_inc(&eie->cap_in_cb);
+			}
 		}
 	}
 
 	err = usb_submit_urb(urb, GFP_ATOMIC);
-	if (err < 0)
+	if (err < 0) {
+		if (!fault)
+			fault = "cannot resubmit urb";
+		abort = true;
+	}
+	spin_unlock_irqrestore(&eie->lock, flags);
+
+	if (elapsed) {
+		snd_pcm_period_elapsed(elapsed);
+		if (atomic_dec_and_test(&eie->cap_in_cb))
+			wake_up(&eie->cb_wait);
+	}
+	if (len % 64)
+		dev_warn_ratelimited(&eie->udev->dev,
+			"Capture urb length %u is not a multiple of 64\n", len);
+	if (abort) {
+		dev_err_ratelimited(&eie->udev->dev, "Capture aborted: %s\n",
+			fault);
 		abort_playback(eie);
+	}
 }
 
 static void min_urb_complete(struct urb *urb)
@@ -1235,7 +1288,13 @@ static int init_cap_urbs(struct eie *eie,
 	int err = 0;
 
 	eie->cap_endpoint_addr = endpoint->bEndpointAddress;
-	eie->cap_buf_size = usb_endpoint_maxp(endpoint);
+	if (!usb_endpoint_maxp(endpoint) ||
+	    CAP_BUF_SIZE % usb_endpoint_maxp(endpoint)) {
+		dev_err(&eie->udev->dev, "Capture buffer size %d does not fit endpoint packet size %d\n",
+			CAP_BUF_SIZE, usb_endpoint_maxp(endpoint));
+		return -EINVAL;
+	}
+	eie->cap_buf_size = CAP_BUF_SIZE;
 	for (j = 0; j < CAP_URB_CNT; j++) {
 		urb = usb_alloc_urb(0, GFP_KERNEL);
 		if (urb == NULL) {
@@ -1243,7 +1302,7 @@ static int init_cap_urbs(struct eie *eie,
 			break;
 		}
 
-		buf = usb_alloc_coherent(eie->udev, usb_endpoint_maxp(endpoint),
+		buf = usb_alloc_coherent(eie->udev, eie->cap_buf_size,
 			GFP_KERNEL, &urb->transfer_dma);
 		if (buf == NULL) {
 			usb_free_urb(urb);
@@ -1253,7 +1312,7 @@ static int init_cap_urbs(struct eie *eie,
 
 		usb_fill_bulk_urb(urb, eie->udev,
 			usb_rcvbulkpipe(eie->udev, eie->cap_endpoint_addr), buf,
-			usb_endpoint_maxp(endpoint), cap_urb_complete, eie);
+			eie->cap_buf_size, cap_urb_complete, eie);
 		urb->transfer_flags = URB_NO_TRANSFER_DMA_MAP;
 
 		eie->cap_urbs[j] = urb;
